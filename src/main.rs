@@ -43,6 +43,10 @@ impl Role {
 
 #[tokio::main]
 async fn main() {
+    // Load `.env` before tracing so `RUST_LOG` in that file takes effect.
+    // A missing file is normal. Variables already in the process environment stay.
+    let dotenv_file = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -50,10 +54,18 @@ async fn main() {
         )
         .init();
 
+    match dotenv_file {
+        Ok(path) => info!(path = %path.display(), "loaded .env"),
+        Err(err) if err.not_found() => {}
+        Err(err) => tracing::warn!(%err, "failed to load .env"),
+    }
+
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());
     let prefix = std::env::var("KEY_PREFIX").unwrap_or_else(|_| "epet:".into());
     let source = Source::from_env(&std::env::var("TRNG_SOURCE").unwrap_or_else(|_| "os".into()));
+    let trng_interval =
+        trng::interval_secs_from_env(std::env::var("TRNG_INTERVAL_SECS").ok().as_deref());
     let role = Role::from_env(&std::env::var("ROLE").unwrap_or_else(|_| "all".into()));
     let api_key = std::env::var("RANDOM_ORG_API_KEY")
         .ok()
@@ -81,19 +93,19 @@ async fn main() {
     }
     if role.collects() {
         let collector = app.clone();
-        tokio::spawn(async move { collect_seeds(collector, source, api_key).await });
+        tokio::spawn(async move { collect_seeds(collector, source, api_key, trng_interval).await });
         let hunger = app.clone();
         tokio::spawn(async move { drain_loop(hunger).await });
     }
 
     if role.serves() {
         let listener = tokio::net::TcpListener::bind(&bind).await.expect("bind");
-        info!(%bind, ?source, ?role, channel = %app.keys.channel(), "e-pet-backend listening");
+        info!(%bind, ?source, ?role, trng_interval_secs = trng_interval, channel = %app.keys.channel(), "e-pet-backend listening");
         axum::serve(listener, http::router(app))
             .await
             .expect("serve");
     } else {
-        info!(?source, ?role, channel = %app.keys.channel(), "seed worker running");
+        info!(?source, ?role, trng_interval_secs = trng_interval, channel = %app.keys.channel(), "seed worker running");
         std::future::pending::<()>().await;
     }
 }
@@ -129,13 +141,26 @@ async fn subscribe_once(app: &App, redis_url: &str) -> redis::RedisResult<()> {
     Ok(())
 }
 
-async fn collect_seeds(app: App, source: Source, api_key: Option<String>) {
+async fn collect_seeds(app: App, source: Source, api_key: Option<String>, trng_interval: u64) {
     let http = reqwest::Client::new();
     let mut last_timestamp = 0u64;
+    let mut last_trng: Option<u64> = None;
     loop {
         let timestamp = http::unix_now();
         if timestamp != last_timestamp {
-            let draw = trng::draw(source, &http, api_key.as_deref()).await;
+            let ask_trng =
+                source == Source::RandomOrg && trng::trng_due(last_trng, trng_interval, timestamp);
+            if ask_trng {
+                // Count the attempt even when RANDOM.ORG fails, so a bad minute
+                // cannot turn into one request per second.
+                last_trng = Some(timestamp);
+            }
+            let draw_source = if ask_trng {
+                Source::RandomOrg
+            } else {
+                Source::Os
+            };
+            let draw = trng::draw(draw_source, &http, api_key.as_deref()).await;
             let tick = SeedTick {
                 seed: draw.seed,
                 timestamp,

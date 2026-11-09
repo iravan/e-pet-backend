@@ -42,7 +42,9 @@ cargo run
 
 `ROLE=all` (the default) runs the seed worker and the SSE server in one process. `ROLE=worker` only publishes seeds and drains hunger. `ROLE=sse` only subscribes and serves HTTP, which is how you add another node.
 
-`TRNG_SOURCE=os` (the default) reads 8 bytes from the operating system and sends them as 16 hex characters with `"type":"LOCAL_CSPRNG_FALLBACK"`. `TRNG_SOURCE=random_org` calls RANDOM.ORG JSON-RPC `generateStrings` once per second. Set `RANDOM_ORG_API_KEY` in the environment. If the key is missing or the call fails, that second uses the OS source.
+`TRNG_SOURCE=os` (the default) reads 8 bytes from the operating system and sends them as 16 hex characters with `"type":"LOCAL_CSPRNG_FALLBACK"`. `TRNG_SOURCE=random_org` still publishes a seed every second, and calls RANDOM.ORG JSON-RPC `generateStrings` only when `TRNG_INTERVAL_SECS` has passed since the previous attempt. The other seconds use the OS source. Set `RANDOM_ORG_API_KEY` in the environment. If the key is missing or the call fails, that second uses the OS source and the interval still has to elapse before the next attempt.
+
+Each RANDOM.ORG call spends 64 bits. A quota of 1,000 requests and 250,000 bits per day runs out of requests first. The default interval of 90 seconds is about 960 requests and 61,440 bits per day. Set `TRNG_INTERVAL_SECS=1` to ask every second.
 
 | Variable | Default |
 | --- | --- |
@@ -50,8 +52,11 @@ cargo run
 | `BIND` | `0.0.0.0:3000` |
 | `KEY_PREFIX` | `epet:` |
 | `TRNG_SOURCE` | `os` |
+| `TRNG_INTERVAL_SECS` | `90` |
 | `RANDOM_ORG_API_KEY` | unset |
 | `ROLE` | `all` |
+
+A `.env` file in the working directory is loaded at startup. A variable already set in the environment is left as it is. A missing file is ignored.
 
 An empty `KEY_PREFIX` uses the handbook names `seed_channel` and `global_current_seed`. The default prefix keeps those keys under `epet:`.
 
@@ -65,7 +70,7 @@ curl -s -X POST localhost:3000/api/cats/momo/verify -H 'content-type: applicatio
 
 `GET /api/stream-seed` is an SSE stream. Each `data` line is `{"seed":"<16 hex chars>","timestamp":<unix seconds>,"type":"TRNG"}` or `"type":"LOCAL_CSPRNG_FALLBACK"`. A new connection also receives the current seed. A client that falls behind gets `{"error":"client_lag"}`. A comment line `: ping` arrives every 15 seconds.
 
-`/verify` returns `202 {"status":"received"}` and checks the claim off the request. The verdict is logged and stored at `{prefix}verdict:{cat}:{timestamp}:{nonce}` for 180 seconds: `accepted`, `rejected`, or `expired`.
+`/verify` returns `202 {"status":"received"}` and checks the claim off the request, rolling against the one current seed. The verdict is logged and stored at `{prefix}verdict:{cat}:{timestamp}:{nonce}` for 180 seconds: `accepted`, `rejected`, or `expired` when no current seed is stored. The timestamp names the verdict.
 
 The client contract, the hunger wheel, and the production notes are in [DESIGN.md](DESIGN.md).
 

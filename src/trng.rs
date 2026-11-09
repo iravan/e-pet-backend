@@ -1,14 +1,40 @@
-//! One entropy draw per second.
+//! Entropy for one published seed.
 //!
 //! `os` is 8 bytes from `getrandom`, hex-encoded to 16 characters.
-//! `random_org` calls RANDOM.ORG JSON-RPC `generateStrings` once, then falls
-//! back to the OS source if the key is missing or the call fails.
+//! `random_org` calls RANDOM.ORG JSON-RPC `generateStrings` for one string,
+//! then falls back to the OS source if the key is missing or the call fails.
+//!
+//! The caller decides when a true-random draw is due. A free RANDOM.ORG key
+//! allows 1,000 requests and 250,000 bits per day. One 16-hex seed costs 64
+//! bits, so the request cap is reached first. The default period of 90
+//! seconds is about 960 requests and 61,440 bits per day.
 
 use std::time::Duration;
 
 use serde::Deserialize;
 
 const RANDOM_ORG_URL: &str = "https://api.random.org/json-rpc/4/invoke";
+
+/// Seconds between RANDOM.ORG calls. Stays under a 1,000 request/day cap.
+pub const DEFAULT_INTERVAL_SECS: u64 = 90;
+
+/// Parse `TRNG_INTERVAL_SECS`. Missing, empty, zero, and non-numeric values
+/// use [`DEFAULT_INTERVAL_SECS`].
+pub fn interval_secs_from_env(value: Option<&str>) -> u64 {
+    value
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs >= 1)
+        .unwrap_or(DEFAULT_INTERVAL_SECS)
+}
+
+/// `last_unix` is the second of the previous RANDOM.ORG attempt. `None` means
+/// this process has not attempted one yet, so the first seed may be true random.
+pub fn trng_due(last_unix: Option<u64>, interval_secs: u64, now_unix: u64) -> bool {
+    match last_unix {
+        None => true,
+        Some(last) => now_unix.saturating_sub(last) >= interval_secs.max(1),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -129,6 +155,23 @@ mod tests {
         assert_eq!(parse_random_org(err), None);
         let short = r#"{"jsonrpc":"2.0","result":{"random":{"data":["abc"]}},"id":1}"#;
         assert_eq!(parse_random_org(short), None);
+    }
+
+    #[test]
+    fn interval_defaults_to_ninety_seconds() {
+        assert_eq!(interval_secs_from_env(None), 90);
+        assert_eq!(interval_secs_from_env(Some("")), 90);
+        assert_eq!(interval_secs_from_env(Some("0")), 90);
+        assert_eq!(interval_secs_from_env(Some("nope")), 90);
+        assert_eq!(interval_secs_from_env(Some("120")), 120);
+    }
+
+    #[test]
+    fn true_random_waits_out_the_period() {
+        assert!(trng_due(None, 90, 1_000));
+        assert!(!trng_due(Some(1_000), 90, 1_089));
+        assert!(trng_due(Some(1_000), 90, 1_090));
+        assert!(trng_due(Some(1_000), 1, 1_001));
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ This follows `rust_backend_sse_architecture.md`: a seed worker, Redis pub/sub, a
 
 ```mermaid
 flowchart LR
-  entropy["Entropy once a second<br/>RANDOM.ORG or OS CSPRNG"] --> worker["Seed worker"]
+  entropy["One seed each second<br/>RANDOM.ORG on the interval, OS otherwise"] --> worker["Seed worker"]
   worker --> redis[("Redis pub/sub<br/>seed_channel")]
   redis --> sse1["SSE node"]
   redis --> sseN["SSE node N"]
@@ -20,7 +20,7 @@ flowchart LR
 
 | Piece | Job |
 | --- | --- |
-| Seed worker | Every second, draw 16 hex characters, store them, `PUBLISH` the JSON |
+| Seed worker | Every second, draw 16 hex characters, store the one current seed, `PUBLISH` the JSON. RANDOM.ORG only when `TRNG_INTERVAL_SECS` is due |
 | Redis | Pub/sub bus. Every SSE node subscribes. The worker is the only publisher |
 | SSE `/api/stream-seed` | Fan the payload out to whoever is connected to this node |
 | Phone | `personal = SHA-256(utf8(seed_hex) ‖ utf8(cat_id))`. Behaviour rolls stay on the phone |
@@ -39,7 +39,7 @@ A phone that connects between seconds receives the current payload first, then e
 
 `seed` is 16 lowercase hex characters (8 bytes). `type` is `TRNG` when RANDOM.ORG returned the string, and `LOCAL_CSPRNG_FALLBACK` when the operating system did.
 
-RANDOM.ORG is the JSON-RPC method `generateStrings`: one string, length 16, alphabet `0123456789abcdef`, replacement on, 800ms timeout, at most once per second. The API key is `RANDOM_ORG_API_KEY`. The default `TRNG_SOURCE=os` never calls the network. A failed RANDOM.ORG call uses the OS for that second and labels it `LOCAL_CSPRNG_FALLBACK`.
+RANDOM.ORG is the JSON-RPC method `generateStrings`: one string, length 16, alphabet `0123456789abcdef`, replacement on, 800ms timeout. A seed is still published every second. `TRNG_INTERVAL_SECS` (default 90) is how many seconds must pass between RANDOM.ORG attempts. The seconds in between are the OS source and are labeled `LOCAL_CSPRNG_FALLBACK`. One call spends 64 bits. At the default interval that is about 960 requests and 61,440 bits per day, inside a quota of 1,000 requests and 250,000 bits. The API key is `RANDOM_ORG_API_KEY`. The default `TRNG_SOURCE=os` never calls the network. A failed RANDOM.ORG call uses the OS for that second, labels it `LOCAL_CSPRNG_FALLBACK`, and still waits out the interval.
 
 The published seed replaces the previous one. Cats stay distinct because each phone salts the seed with its own id.
 
@@ -49,14 +49,13 @@ Prefix defaults to `epet:`. An empty prefix is the handbook's bare names.
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `{prefix}global_current_seed` | string, 10s TTL | Latest seed JSON. A new SSE node reads this on subscribe |
-| `{prefix}seed:{unix}` | string, 180s TTL | Hex seed for that second, so a loot claim can name the second |
+| `{prefix}global_current_seed` | string, 10s TTL | The one current seed JSON. A new SSE node reads this on subscribe, and a loot check rolls against it |
 | `{prefix}seed_channel` | pub/sub channel | Same JSON as the SSE `data` line |
 | `{prefix}hunger` | sorted set | Member is the cat id. Score is the next drain time |
 | `{prefix}cat:{id}` | hash | `name`, `fullness` (0–100), `status` `ALIVE` or `DEAD` |
 | `{prefix}verdict:{id}:{timestamp}:{nonce}` | string, 180s TTL | `accepted`, `rejected`, or `expired` |
 
-The 10-second key is the hot cache from the handbook. Loot claims quote an older timestamp, and a queue can sit longer than 10 seconds, so each second is also stored for 180 seconds.
+One seed is enough. Each publish replaces `global_current_seed`. A loot check rolls against whatever seed is current, so the claim timestamp does not select an older seed. `expired` means that key is missing.
 
 Cat ids are 1–64 characters of ASCII letters, digits, `_`, and `-`.
 
@@ -85,11 +84,14 @@ The hunger task runs only in `ROLE=all` and `ROLE=worker`. SSE nodes do not drai
 
 These run on the phone after a life event. The server does not replay them. `/verify` is only for a loot claim.
 
-| Event | Weights |
-| --- | --- |
-| `FOOD_EVENT` (食) | sleep 50, groom 30, walk 15, zoomies 5 |
-| `POOP_EVENT` (痾) | zoomies 60, walk 25, groom 10, sleep 5 |
-| `WAKE_EVENT` (瞓醒) | hungry 60, walk 25, zoomies 10, groom 5 |
+| Event | Weights | On the phone |
+| --- | --- | --- |
+| `FOOD_EVENT` (食) | sleep 50, groom 30, walk 15, zoomies 5 | locked 30 minutes |
+| `POOP_EVENT` (痾) | zoomies 60, walk 25, groom 10, sleep 5 | locked 5 minutes |
+| `WAKE_EVENT` (瞓醒) | hungry 60, walk 25, zoomies 10, groom 5 | hungry until a feed succeeds |
+| Idle, every second | walk 10, sit 85, hungry 5 | until one of the events above |
+
+The idle row and the lock times come from the original proposal. They are phone rules. This server does not store them and does not replay them.
 
 ```text
 personal = SHA-256(utf8(seed_hex) ‖ utf8(cat_id))
@@ -122,7 +124,7 @@ roll = first 8 bytes of state as a big-endian u64
 hit = (roll mod 100) < 5
 ```
 
-The handbook does not fix the loot odds. This server treats a hit as 5 of 100 so the check has a real window. `accepted` means the roll landed in that window. `rejected` means it did not. `expired` means the seed for that unix second is already gone. The string is logged and written to the verdict key.
+The handbook does not fix the loot odds. This server treats a hit as 5 of 100 so the check has a real window. `accepted` means the roll against the current seed landed in that window. `rejected` means it did not. `expired` means no current seed is stored. The string is logged and written to the verdict key. The timestamp on the claim only names that verdict.
 
 There is no reward inventory and no ban list yet. The verdict is the whole result.
 
@@ -167,10 +169,18 @@ net.ipv4.tcp_max_orphans = 262144
 
 Then `sysctl -p`.
 
-Put Cloudflare in front of `GET /api/stream-seed`. Cloudflare can hold the public SSE connections. The origin then keeps a small number of streams to the edge. Add capacity by running more `ROLE=sse` processes behind a load balancer. They share Redis and hold no cat state. The seed worker stays a single process so RANDOM.ORG is called once per second, not once per node.
+Put Cloudflare in front of `GET /api/stream-seed`. Cloudflare holds the public TCP connections. The origin keeps a small number of streams to the edge. Add capacity with more `ROLE=sse` processes behind a load balancer, one machine or many. Those nodes share Redis and hold no cat state. The seed worker stays a single process so RANDOM.ORG is called on that process at `TRNG_INTERVAL_SECS`, not once per node.
 
-The handbook's memory sketch: about 1 KB per SSE connection in Rust, on the order of 1–2 GB for a million connections on one 2-core 4 GB box, against roughly 15–30 KB and 20–30 GB for a Node connection. SSE is the wire protocol. WebSocket is not used.
+| | Node connection | Rust SSE connection |
+| --- | --- | --- |
+| Memory each | about 15–30 KB | about 1 KB |
+| A million connections | about 20–30 GB, several machines | about 1–2 GB, sketched for one 2-core 4 GB machine |
+| Wire | WebSocket in the original notes | SSE here. One direction, and a dropped phone reconnects |
+
+## Earlier drafts
+
+`~/Downloads/electronic_cat_trng_proposal.md` and `~/Downloads/rust_backend_sse_architecture.md` are the earlier thread. They are where the edge-compute idea, the weight table, the SSE fan-out, and the Linux limits come from. They are not the spec for this crate. Those notes still call RANDOM.ORG once a second, show a Node seed worker and an Axum 0.7 sample, and replay a loot claim against the seed of that unix second. This server publishes a seed every second, calls RANDOM.ORG on `TRNG_INTERVAL_SECS`, uses Axum 0.8, and rolls a claim against the one current seed.
 
 ## What this does not do
 
-It does not render the cat, store accounts, grant items, or run the blink loop. A million blinks a second belong on the phones. The server's job is the seed, the hunger clock, and a replay when a client claims a pickup.
+It does not render the cat, store accounts, grant items, run the blink loop, or enforce the phone cooldowns. A million blinks a second belong on the phones. The server's job is the seed, the hunger clock, and a replay when a client claims a pickup.

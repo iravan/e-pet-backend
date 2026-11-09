@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{self, FULLNESS_CAP};
 
-/// Hot cache of the latest payload. The handbook's replay window.
+/// Latest seed payload. Refreshed every publish, so a short TTL is enough.
 const CURRENT_TTL_SECS: u64 = 10;
-/// Per-second history. Loot claims quote a timestamp, so this outlives the hot cache.
-const SEED_TTL_SECS: u64 = 180;
+/// How long a loot verdict stays readable.
+const VERDICT_TTL_SECS: u64 = 180;
 
 #[derive(Clone, Debug)]
 pub struct Keys {
@@ -44,10 +44,6 @@ impl Keys {
 
     fn global(&self) -> String {
         format!("{}global_current_seed", self.prefix)
-    }
-
-    fn seed_at(&self, timestamp: u64) -> String {
-        format!("{}seed:{}", self.prefix, timestamp)
     }
 
     fn verdict(&self, id: &str, timestamp: u64, nonce: u64) -> String {
@@ -110,9 +106,6 @@ pub async fn save_seed(
 ) -> redis::RedisResult<()> {
     let body = serde_json::to_string(tick).unwrap_or_default();
     let _: () = con.set_ex(keys.global(), &body, CURRENT_TTL_SECS).await?;
-    let _: () = con
-        .set_ex(keys.seed_at(tick.timestamp), &tick.seed, SEED_TTL_SECS)
-        .await?;
     let _: () = con.publish(keys.channel(), &body).await?;
     Ok(())
 }
@@ -123,15 +116,6 @@ pub async fn load_current(
 ) -> redis::RedisResult<Option<SeedTick>> {
     let body: Option<String> = con.get(keys.global()).await?;
     Ok(body.and_then(|text| serde_json::from_str(&text).ok()))
-}
-
-pub async fn load_seed(
-    con: &mut ConnectionManager,
-    keys: &Keys,
-    timestamp: u64,
-) -> redis::RedisResult<Option<String>> {
-    let hex_seed: Option<String> = con.get(keys.seed_at(timestamp)).await?;
-    Ok(hex_seed.filter(|text| crypto::valid_seed(text)))
 }
 
 pub async fn create_cat(
@@ -355,9 +339,11 @@ impl Verdict {
     }
 }
 
-/// Replay a loot claim from the seed stored for `timestamp`.
+/// Roll a loot claim against the one current seed.
 ///
-/// The result is written under `verdict:{id}:{timestamp}:{nonce}` for 180 seconds.
+/// `timestamp` only names the stored verdict. The result is written under
+/// `verdict:{id}:{timestamp}:{nonce}` for 180 seconds. `Expired` means no
+/// current seed is stored.
 pub async fn judge(
     con: &mut ConnectionManager,
     keys: &Keys,
@@ -365,16 +351,20 @@ pub async fn judge(
     timestamp: u64,
     nonce: u64,
 ) -> Result<Verdict, CatError> {
-    let verdict = match load_seed(con, keys, timestamp).await? {
-        Some(seed) if crypto::lucky_hit(&seed, id, nonce) => Verdict::Accepted,
-        Some(_) => Verdict::Rejected,
-        None => Verdict::Expired,
+    let verdict = match load_current(con, keys).await? {
+        Some(tick)
+            if crypto::valid_seed(&tick.seed) && crypto::lucky_hit(&tick.seed, id, nonce) =>
+        {
+            Verdict::Accepted
+        }
+        Some(tick) if crypto::valid_seed(&tick.seed) => Verdict::Rejected,
+        _ => Verdict::Expired,
     };
     let _: () = con
         .set_ex(
             keys.verdict(id, timestamp, nonce),
             verdict.as_str(),
-            SEED_TTL_SECS,
+            VERDICT_TTL_SECS,
         )
         .await?;
     Ok(verdict)
@@ -436,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_seed_keeps_history_and_judge_replays_it() {
+    async fn save_seed_stores_one_current_seed_and_judge_uses_it() {
         let Some((mut con, keys)) = test_conn("seed").await else {
             eprintln!("redis is not running; skip store test");
             return;
@@ -452,11 +442,6 @@ mod tests {
         let ttl: i64 = con.ttl(keys.global()).await.unwrap();
         assert!((1..=10).contains(&ttl));
 
-        let loaded = load_seed(&mut con, &keys, tick.timestamp)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded, tick.seed);
         let verdict = judge(&mut con, &keys, "momo", tick.timestamp, 245)
             .await
             .unwrap();
@@ -472,15 +457,29 @@ mod tests {
             .unwrap();
         assert_eq!(stored, verdict.as_str());
 
-        let gone = judge(&mut con, &keys, "momo", 1, 1).await.unwrap();
-        assert_eq!(gone, Verdict::Expired);
+        // The claim timestamp does not select a seed. Both claims see the current one.
+        let other = judge(&mut con, &keys, "momo", 1, 1).await.unwrap();
+        let other_expect = if crypto::lucky_hit(&tick.seed, "momo", 1) {
+            Verdict::Accepted
+        } else {
+            Verdict::Rejected
+        };
+        assert_eq!(other, other_expect);
 
         let _: () = con.del(keys.global()).await.unwrap();
-        let _: () = con.del(keys.seed_at(tick.timestamp)).await.unwrap();
+        let gone = judge(&mut con, &keys, "momo", tick.timestamp, 2)
+            .await
+            .unwrap();
+        assert_eq!(gone, Verdict::Expired);
+
         let _: () = con
             .del(keys.verdict("momo", tick.timestamp, 245))
             .await
             .unwrap();
         let _: () = con.del(keys.verdict("momo", 1, 1)).await.unwrap();
+        let _: () = con
+            .del(keys.verdict("momo", tick.timestamp, 2))
+            .await
+            .unwrap();
     }
 }
