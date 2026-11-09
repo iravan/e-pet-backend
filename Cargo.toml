@@ -1,0 +1,20 @@
+[package]
+name = "e-pet-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Seed broadcast and hunger time-wheel for a million electronic cats"
+
+[dependencies]
+axum = "0.8"
+futures = "0.3"
+getrandom = "0.2"
+hex = "0.4"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
